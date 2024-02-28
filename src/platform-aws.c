@@ -26,34 +26,46 @@ struct ec2_platform_data {
 	const char* topology;
 	int default_dup_conns;
 	float latency;
+	bool gdr_required;
+	bool net_flush_required;
 } platform_data_map[] = {
 	{
 		.name = "p4d.24xlarge",
 		.topology = "p4d-24xl-topo.xml",
 		.default_dup_conns = 0,
 		.latency = 75.0,
+		.gdr_required = true,
+		.net_flush_required = true,
 	},
 	{
 		.name = "p4de.24xlarge",
 		.topology = "p4de-24xl-topo.xml",
 		.default_dup_conns = 0,
 		.latency = 75.0,
+		.gdr_required = true,
+		.net_flush_required = true,
 	},
 	{
 		.name = "p3dn.24xlarge",
 		.topology = NULL,
 		.default_dup_conns = 4,
 		.latency = 150.0,
+		.gdr_required = false,
+		.net_flush_required = true,
 	},
 	{
 		.name = "p5.48xlarge",
 		.topology = "p5.48xl-topo.xml",
 		.default_dup_conns = 0,
 		.latency = 75.0,
+		.gdr_required = true,
+		.net_flush_required = false,
 	},
 	{
 		.name = "g5.48xlarge",
 		.topology = "g5.48xl-topo.xml",
+		.gdr_required = false,
+		.net_flush_required = true,
 	},
 };
 
@@ -225,7 +237,7 @@ static int configure_nccl_proto(void)
 				      strerror(errno));
 			return -errno;
 		}
-	} else if (strcmp(getenv("NCCL_PROTO"), "simple") != 0) {
+	} else if (strcasecmp(getenv("NCCL_PROTO"), "simple") != 0) {
 		NCCL_OFI_WARN("NCCL_PROTO was set to \"LL/LL128\", but the Libfabric endpoint does not support 128 byte in-order aligned stores. This endpoint may corrupt data during communication");
 	}
 
@@ -244,7 +256,7 @@ static int configure_ep_inorder(struct fid_ep *ep, int optname, const char* optn
 				bool *have_ordering)
 {
 #if HAVE_DECL_FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES
-	int ret = ncclSuccess;
+	int ret = 0;
 	bool optval = true;
 
 	*have_ordering = false;
@@ -271,8 +283,8 @@ static int configure_ep_inorder(struct fid_ep *ep, int optname, const char* optn
 
 int configure_nvls_option(void)
 {
-	/* Disable NVLS topology discovery.  There's a bug with EFA
-	 * and NCCL version 2.18.3 and earlier on platforms with
+	/* Disable NVLS topology discovery for older NCCL versions. There's a
+	 * bug with EFA and NCCL version 2.18.3 and earlier on platforms with
 	 * NVLink Switch support.  We selectively disable NVLS support
 	 * to avoid the bug, which was fixed in 2.18.5.
 	 */
@@ -284,12 +296,14 @@ int configure_nvls_option(void)
 	if (getenv("NCCL_NVLS_ENABLE") == NULL) {
 		nccl_get_version = dlsym(RTLD_DEFAULT, "ncclGetVersion");
 		if (nccl_get_version == NULL) {
-			NCCL_OFI_WARN("Could not find ncclGetVersion symbol");
+			NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET,
+			    "Could not find ncclGetVersion symbol; skipping NVLS NCCL version check");
+			return 0;
 		} else {
 			nccl_ret = nccl_get_version(&version);
 			if (nccl_ret != ncclSuccess) {
 				NCCL_OFI_WARN("ncclGetVersion returned %d", nccl_ret);
-				return nccl_ret;
+				return -ENOTSUP;
 			}
 
 			NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "ncclGetVersion results = %lu", version);
@@ -301,7 +315,7 @@ int configure_nvls_option(void)
 			ret = setenv("NCCL_NVLS_ENABLE", "0", 1);
 			if (ret != 0) {
 				NCCL_OFI_WARN("Unable to set NCCL_NVLS_ENABLE");
-				return ret;
+				return -errno;
 			}
 		} else {
 			NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Not disabling NVLS support due to NCCL version %lu", version);
@@ -321,12 +335,10 @@ int configure_nvls_option(void)
  * 		   if we find no match
  * 		error, on failure
  */
-ncclResult_t platform_init(void)
+int platform_init(void)
 {
 	int ret = ncclSuccess;
-	int rc = 0;
 	struct ec2_platform_data *platform_data;
-	uint32_t libversion = 0;
 
 	NCCL_OFI_INFO(NCCL_INIT, "Configuring AWS-specific options");
 
@@ -371,27 +383,67 @@ ncclResult_t platform_init(void)
 	 * environment variable on Neuron platforms, so we only do
 	 * this for Nvidia platforms.
 	 */
-	libversion = fi_version();
+	uint32_t libversion = fi_version();
 	const char * fork_safe_var_name =
 		(FI_MAJOR(libversion) > 1 || (FI_MAJOR(libversion) == 1 && FI_MINOR(libversion) >= 13))
 		? "FI_EFA_FORK_SAFE"
 		: "RDMAV_FORK_SAFE";
 	if (!getenv(fork_safe_var_name)) {
 		NCCL_OFI_INFO(NCCL_INIT, "Setting %s environment variable to 1", fork_safe_var_name);
-		rc = setenv(fork_safe_var_name, "1", 1);
-		if (rc != 0) {
+		ret = setenv(fork_safe_var_name, "1", 1);
+		if (ret != 0) {
 			NCCL_OFI_WARN("Unable to set %s", fork_safe_var_name);
-			ret = ncclSystemError;
+			ret = -errno;
 			goto exit;
 		}
 	}
 
-	rc = configure_nvls_option();
-	if (rc != 0) {
+	ret = configure_nvls_option();
+	if (ret != 0) {
 		NCCL_OFI_WARN("Unable to configure NVLS option");
-		ret = ncclSystemError;
 		goto exit;
 	}
+
+	if ((platform_data && !platform_data->net_flush_required) &&
+	    NULL == getenv("NCCL_NET_FORCE_FLUSH")) {
+
+		/* Hopper GPUs do not require a network flush, but NCCL versions <2.19.1
+		* still enable flush by default on any GPU type.
+		* For GPU generations earlier than Hopper, NCCL always enables flush, while
+		* for Hopper GPUs flush is enabled or disabled depending on the value of
+		* the NCCL_NET_FORCE_FLUSH environment variable. The default value for this
+		* variable is 1 for NCCL versions <2.19.1, which forces flush when it is not
+		* needed, so it is safe to set it to 0 if it is not explicitly set.
+		*/
+
+		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Setting NCCL_NET_FORCE_FLUSH=0 for Hopper GPUs");
+		ret = setenv("NCCL_NET_FORCE_FLUSH", "0", 0);
+		if (ret != 0) {
+			NCCL_OFI_WARN("Unable to set NCCL_NET_FORCE_FLUSH");
+			ret = -errno;
+			goto exit;
+		}
+	}
+
+	/*
+	 * NCCL v2.19.3 reduced the chunk size used when running NVLS Tree
+	 * algorithm on greater than 4 nodes to 64KiB. This drastically impacted
+	 * performance on AWS (Ref: https://github.com/NVIDIA/nccl/pull/1112/
+	 * for some data). NCCL v2.20.3 has made this a tunable. Based on
+	 * empirical testing, a max chunk size of 512KiB recovers from the
+	 * regression and was also observed to be the default in v2.19.3.
+	 * Setting this unconditionally without relying on ncclGetVersion symbol
+	 * being available, since the parameter did not exist in versions prior
+	 * to v2.20.
+	 */
+	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Setting NCCL_NVLSTREE_MAX_CHUNKSIZE to 512KiB");
+	ret = setenv("NCCL_NVLSTREE_MAX_CHUNKSIZE", "524288", 0);
+	if (ret != 0) {
+		NCCL_OFI_WARN("Unable to set NCCL_NVLSTREE_MAX_CHUNKSIZE");
+		ret = -errno;
+		goto exit;
+	}
+
 #endif
 
 	/*
@@ -405,12 +457,12 @@ ncclResult_t platform_init(void)
 	} else if (platform_data && platform_data->topology) {
 		char topology_path[PATH_MAX];
 
-		rc = snprintf(topology_path, sizeof(topology_path), "%s/%s",
-				XML_DIR, platform_data->topology);
-		if (rc < 0 || rc >= sizeof(topology_path)) {
+		ret = snprintf(topology_path, sizeof(topology_path), "%s/%s",
+			       XML_DIR, platform_data->topology);
+		if (ret < 0 || ret >= sizeof(topology_path)) {
 			NCCL_OFI_WARN("Error occurred while forming the complete topology XML file path. RC: %d, Buffer Size: %d, XML dir: %s, Topology file: %s",
-					rc, PATH_MAX, XML_DIR, platform_data->topology);
-			ret = ncclSystemError;
+				      ret, PATH_MAX, XML_DIR, platform_data->topology);
+			ret = -ENOMEM;
 			goto exit;
 		}
 
@@ -418,10 +470,10 @@ ncclResult_t platform_init(void)
 				"Running on %s platform, Setting NCCL_TOPO_FILE environment variable to %s",
 				get_platform_type(), topology_path);
 
-		rc = setenv("NCCL_TOPO_FILE", topology_path, 1);
-		if (rc != 0) {
+		ret = setenv("NCCL_TOPO_FILE", topology_path, 1);
+		if (ret != 0) {
 			NCCL_OFI_WARN("Unable to set NCCL_TOPO_FILE");
-			ret = ncclSystemError;
+			ret = -errno;
 			goto exit;
 		}
 
@@ -445,24 +497,29 @@ exit:
 	return ret;
 }
 
-ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
-	static bool nccl_proto_configured = false;
-	static bool need_ordering = false;
-	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-	int ret = ncclSuccess;
-	int optname = -1;
-	const char *optname_name = "none";
+int platform_config_endpoint(struct fi_info *info, struct fid_ep* endpoint) {
+	int ret = 0;
 
 	if (endpoint == NULL) {
 		NCCL_OFI_WARN("Unable to configure invalid endpoint");
-		ret = ncclSystemError;
+		ret = -EINVAL;
 		goto exit;
 	}
 
 	/* short circuit when not using EFA */
 	if (0 != strcmp(info->fabric_attr->prov_name, "efa")) {
-		ret = ncclSuccess;
+		ret = 0;
 		goto exit;
+	}
+
+	if (ofi_nccl_disable_gdr_required_check() == 0) {
+		/* Ensure GDR is enabled on GDR-supported instances */
+		struct ec2_platform_data *platform_data = get_platform_data();
+		if (platform_data && platform_data->gdr_required && support_gdr != GDR_SUPPORTED) {
+			NCCL_OFI_WARN("GDR disabled on GDR-supported instance type %s", platform_data->name);
+			ret = -EINVAL;
+			goto exit;
+		}
 	}
 
 	/* If the selected communication protocol is RDMA write and the user did
@@ -471,16 +528,21 @@ ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpo
 	 * emulated writes are disabled.
 	 */
 
-	if (0 == strcmp("RDMA", nccl_ofi_selected_protocol) &&
+	if (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol) &&
 	    ofi_nccl_disable_native_rdma_check() == 0) {
 		ret = validate_rdma_write(endpoint);
 		if (ret != 0) {
-			ret = ncclSystemError;
 			goto exit;
 		}
 	}
 
 #if HAVE_CUDA
+	static bool nccl_proto_configured = false;
+	static bool need_ordering = false;
+	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+	int optname = -1;
+	const char *optname_name = "none";
+
 	/* During initialization, try to set
 	 * FI_OPT_EFA_{SENDRECV,WRTIE}_IN_ORDER_ALIGNED_128_BYTES to
 	 * true to see if the LL/LL128 protocol is supported. After
@@ -488,19 +550,19 @@ ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpo
 	 * was previously set and error if we can't set them the same
 	 * way later.
 	 */
-	if (0 == strcmp("SENDRECV", nccl_ofi_selected_protocol)) {
+	if (0 == strcasecmp("SENDRECV", nccl_ofi_selected_protocol)) {
 #if HAVE_DECL_FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES
 		optname = FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES;
 		optname_name = "FI_OPT_EFA_SENDRECV_IN_ORDER_ALIGNED_128_BYTES";
 #endif
-	} else if (0 == strcmp("RDMA", nccl_ofi_selected_protocol)) {
+	} else if (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol)) {
 #if HAVE_DECL_FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES
 		optname = FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES;
 		optname_name = "FI_OPT_EFA_WRITE_IN_ORDER_ALIGNED_128_BYTES";
 #endif
 	} else {
 		NCCL_OFI_WARN("unkonwn transport %s", nccl_ofi_selected_protocol);
-		ret = ncclSystemError;
+		ret = -EINVAL;
 		goto exit;
 	}
 
@@ -514,6 +576,31 @@ ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpo
 	 * ordering.  If we're not expecting ordering, we don't really
 	 * care if ordering is on or off for the endpoint.
 	 */
+
+	/* TODO: This is a temporary hack to disable setting
+	 * NCCL_PROTO=simple on P5 when using the RDMA protocol.  EFA
+	 * on P5 does not currently report
+	 * WRITE_IN_ORDER_ALIGNED_128_BYTES because it can deliver the
+	 * (correct) payload twice.  This violates the meaning of the
+	 * WRITE_IN_ORDER_ALIGNED_128_BYTES flag in rdma-core, but
+	 * does not violate any assumptions about buffer reuse in
+	 * NCCL.  We have confirmed that the EFA provider in Libfabric
+	 * will not segment messages for fi_write(), so this is safe.
+	 * Note that the SENDRECV protocol does have segmentation
+	 * challenges that require us to obey the
+	 * SENDRECV_IN_ORDER_ALIGNED_128_BYTES flag, so we only skip
+	 * the check when using the RDMA protocol.
+	 */
+	if ((NULL == getenv("NCCL_PROTO")) &&
+	    (0 == strcasecmp("RDMA", nccl_ofi_selected_protocol)) &&
+	    (0 == strcmp(get_platform_type(), "p5.48xlarge"))) {
+		if (!nccl_proto_configured) {
+			NCCL_OFI_INFO(NCCL_INIT, "Skipping NCCL_PROTO checks on P5 + RDMA");
+			need_ordering = false;
+			nccl_proto_configured = true;
+		}
+	}
+
 	if (need_ordering || !nccl_proto_configured) {
 		bool have_ordering = false;
 
@@ -522,7 +609,6 @@ ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpo
 						   &have_ordering);
 			if (ret != 0) {
 				NCCL_OFI_WARN("Unexpected failure setting inorder %d", ret);
-				ret = ncclSystemError;
 				goto unlock;
 			}
 		}
@@ -530,7 +616,7 @@ ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpo
 		if (need_ordering && !have_ordering) {
 			NCCL_OFI_WARN("Setting %s option failed after succeeding during initialization",
 				      optname_name);
-			ret = ncclSystemError;
+			ret = -ENOTSUP;
 			goto unlock;
 		}
 
@@ -542,7 +628,7 @@ ncclResult_t platform_config_endpoint(struct fi_info *info, struct fid_ep* endpo
 				ret = configure_nccl_proto();
 				if (ret != 0) {
 					NCCL_OFI_WARN("Failed to set NCCL_PROTO: %d", ret);
-					ret = ncclSystemError;
+					ret = -ENOTSUP;
 					goto unlock;
 				}
 			}

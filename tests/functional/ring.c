@@ -20,7 +20,8 @@ int main(int argc, char *argv[])
 	char handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
 	char src_handle_prev[NCCL_NET_HANDLE_MAXSIZE] = {0};
 	char src_handle_next[NCCL_NET_HANDLE_MAXSIZE] = {0};
-	ncclNet_t *extNet = NULL;
+	ncclNetDeviceHandle_v7_t *s_ignore, *r_ignore;
+	test_nccl_net_t *extNet = NULL;
 
 	ofi_log_function = logger;
 
@@ -52,6 +53,12 @@ int main(int argc, char *argv[])
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	if (size < 2) {
+		NCCL_OFI_WARN("Expected at least two ranks but got %d. "
+			"The ring functional test should be run with at least two ranks.",
+			size);
+		return 1;
+	}
 
 	char all_proc_name[size][MPI_MAX_PROCESSOR_NAME];
 
@@ -71,8 +78,11 @@ int main(int argc, char *argv[])
 	/* Set CUDA device for subsequent device memory allocation, in case GDR is used */
 	cuda_dev = local_rank;
 	NCCL_OFI_TRACE(NCCL_NET, "Using CUDA device %d for memory allocation", cuda_dev);
-	CUDACHECK(cudaSetDevice(cuda_dev));
 
+	CUDACHECK(cuInit(0));
+	CUcontext context;
+	CUDACHECK(cuCtxCreate(&context, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, cuda_dev));
+	CUDACHECK(cuCtxSetCurrent(context));
 	/*
 	 * Calculate the rank of the next process in the ring.  Use the
 	 * modulus operator so that the last process "wraps around" to
@@ -84,7 +94,7 @@ int main(int argc, char *argv[])
 	/* Get external Network from NCCL-OFI library */
 	extNet = get_extNet();
 	if (extNet == NULL)
-		return -1;
+		return 1;
 
 	/* Init API */
 	OFINCCLCHECK(extNet->init(&logger));
@@ -100,7 +110,7 @@ int main(int argc, char *argv[])
 
         /* Get Properties for the device */
         for (dev = 0; dev < ndev; dev++) {
-                ncclNetProperties_t props = {0};
+                test_nccl_properties_t props = {0};
                 OFINCCLCHECK(extNet->getProperties(dev, &props));
                 print_dev_props(dev, &props);
 
@@ -137,7 +147,7 @@ int main(int argc, char *argv[])
 	/* Connect to next rank */
 	NCCL_OFI_INFO(NCCL_NET, "Send connection request to rank %d", next);
 	while (sComm_next == NULL)
-		OFINCCLCHECK(extNet->connect(dev, (void *)src_handle_next, (void **)&sComm_next));
+		OFINCCLCHECK(extNet->connect(dev, (void *)src_handle_next, (void **)&sComm_next, &s_ignore));
 
 	/*
 	 * Accept API: accept connection from prev rank as the data flow is
@@ -145,7 +155,7 @@ int main(int argc, char *argv[])
 	 */
 	NCCL_OFI_INFO(NCCL_NET, "Server: Start accepting requests");
 	while (rComm == NULL)
-		OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm));
+		OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm, &r_ignore));
 	NCCL_OFI_INFO(NCCL_NET, "Successfully accepted connection from rank %d", prev);
 
 	/* Send NUM_REQUESTS to next rank */

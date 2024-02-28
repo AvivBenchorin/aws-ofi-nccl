@@ -7,6 +7,9 @@ libnccl-net.so
 tags
 config.h
 
+src/tuner/.dirstamp
+src/tuner/*.lo
+
 tests/functional/*.o
 tests/unit/*.o
 tests/unit/*.log
@@ -19,6 +22,7 @@ tests/unit/msgbuff
 tests/unit/freelist
 tests/unit/deque
 tests/unit/scheduler
+tests/unit/idpool
 
 # http://www.gnu.org/software/automake
 .deps/

@@ -20,19 +20,28 @@ int main(int argc, char* argv[])
 	nccl_net_ofi_send_comm_t *sComm = NULL;
 	nccl_net_ofi_listen_comm_t *lComm = NULL;
 	nccl_net_ofi_recv_comm_t *rComm = NULL;
+	ncclNetDeviceHandle_v7_t *s_ignore, *r_ignore;
 	char src_handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
-	ncclNet_t *extNet = NULL;
+	test_nccl_net_t *extNet = NULL;
 
 	ofi_log_function = logger;
 
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	int size;
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	if (size != 2) {
+		NCCL_OFI_WARN("Expected two ranks but got %d. "
+			"The nccl_connection functional test should be run with exactly two ranks.",
+			size);
+		return 1;
+	}
 	MPI_Get_processor_name(name, &proc_name);
 
 	/* Get external Network from NCCL-OFI library */
 	extNet = get_extNet();
 	if (extNet == NULL)
-		return -1;
+		return 1;
 
 	/* Init API */
 	OFINCCLCHECK(extNet->init(logger));
@@ -48,7 +57,7 @@ int main(int argc, char* argv[])
 
 	/* Get Properties for the device */
 	for (dev = 0; dev < ndev; dev++) {
-		ncclNetProperties_t props = {0};
+		test_nccl_properties_t props = {0};
 		OFINCCLCHECK(extNet->getProperties(dev, &props));
 		print_dev_props(dev, &props);
 
@@ -81,13 +90,13 @@ int main(int argc, char* argv[])
 		/* Connect API */
 		NCCL_OFI_INFO(NCCL_INIT, "Send connection request to rank %d", rank + 1);
 		while (sComm == NULL) {
-			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm));
+			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm, &s_ignore));
 		}
 
 		/* Accept API */
 		NCCL_OFI_INFO(NCCL_INIT, "Server: Start accepting requests");
 		while (rComm == NULL) {
-			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm));
+			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm, &r_ignore));
 		}
 		NCCL_OFI_INFO(NCCL_INIT, "Successfully accepted connection from rank %d",
 			      rank + 1);
@@ -103,13 +112,13 @@ int main(int argc, char* argv[])
 		/* Connect API */
 		NCCL_OFI_INFO(NCCL_INIT, "Send connection request to rank %d", rank - 1);
 		while (sComm == NULL) {
-			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm));
+			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm, &s_ignore));
 		}
 
 		/* Accept API */
 		NCCL_OFI_INFO(NCCL_INIT, "Server: Start accepting requests");
 		while (rComm == NULL) {
-			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm));
+			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm, &r_ignore));
 		}
 		NCCL_OFI_INFO(NCCL_INIT, "Successfully accepted connection from rank %d",
 			      rank - 1);

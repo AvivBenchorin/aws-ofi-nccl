@@ -15,6 +15,7 @@ extern "C" {
 #include "nccl_ofi.h"
 #include "nccl_ofi_freelist.h"
 #include "nccl_ofi_log.h"
+#include "nccl_ofi_idpool.h"
 
 typedef enum nccl_net_ofi_sendrecv_req_state {
 	NCCL_OFI_SENDRECV_REQ_CREATED = 0,
@@ -189,7 +190,7 @@ typedef struct nccl_net_ofi_sendrecv_device {
 	struct fid_domain *domain;
 
 	/* Memory registration key pool */
-	nccl_ofi_mr_keypool_t key_pool;
+	nccl_ofi_idpool_t key_pool;
 } nccl_net_ofi_sendrecv_device_t;
 	
 typedef struct nccl_net_ofi_sendrecv_req {
@@ -220,9 +221,10 @@ typedef struct nccl_net_ofi_sendrecv_req {
 /*
  * @brief	Initialize plugin with sendrecv protocol structures
  */
-ncclResult_t nccl_net_ofi_sendrecv_init(struct fi_info *ofi_info_list,
-					int num_ofi_infos,
-					bool provide_own_mr_key);
+int nccl_net_ofi_sendrecv_init(struct fi_info *ofi_info_list,
+			       int num_ofi_infos,
+			       bool provide_own_mr_key,
+			       nccl_net_ofi_plugin_t **plugin_p);
 
 #ifdef _cplusplus
 } // End extern "C"

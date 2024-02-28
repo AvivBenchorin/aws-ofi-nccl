@@ -25,12 +25,10 @@
 #include "nccl_ofi_rdma.h"
 #include "nccl_ofi_topo.h"
 #include "nccl_ofi_math.h"
+#include "nccl_ofi_idpool.h"
 
 #define EFA_PROVIDER_NAME "efa"
 #define IS_EFA_PROVIDER(NAME) (strcmp((NAME), EFA_PROVIDER_NAME)==0)
-
-/* nccl_net_ofi plugin */
-nccl_net_ofi_plugin_t *plugin = NULL;
 
 /* Indicates if GPUDirect is supported by libfabric provider */
 enum gdr_support_level_t support_gdr = GDR_UNKNOWN;
@@ -54,18 +52,6 @@ int nic_dup_conns = 0;
    const), but will not change during execution.  Therefore, it may be
    read in the polling loop without protection of a lock. */
 size_t cq_read_count = 1;
-
-// Logger Function
-ncclDebugLogger_t ofi_log_function = NULL;
-/*
- * Maximum numbers of requests supported per communicator by
- * plugin. Since NCCL Net v5, one NCCL request can correspond to
- * multiple network requests with `n` identifier passed to
- * irecv(). Therefore, the total number of requests that plugin should
- * support is product of number of NCCL requests and maximum number of
- * recvs supported by plugin.
- */
-int max_reqs = NCCL_OFI_MAX_REQUESTS * NCCL_OFI_MAX_RECVS;
 
 const char *provider_filter = NULL;
 
@@ -170,86 +156,6 @@ void nccl_net_ofi_free_info_list(struct fi_info *info_list)
 			break;
 		}
 	}
-}
-
-/*
- * @brief	Allocate a memory registration key
- *
- * Extract an available key from the key pool, mark the key as
- * unavailable in the key pool, and return extracted key. Noop in case
- * no key was available.
- *
- * This operation is locked by the key pool's internal lock.
- *
- * @param	key_pool
- *		The Key pool
- * @return	Extracted key, on susccess
- *		FI_KEY_NOTAVAIL, in case no key is available
- */
-uint64_t nccl_net_ofi_allocate_mr_key(nccl_ofi_mr_keypool_t *key_pool)
-{
-	uint64_t key = FI_KEY_NOTAVAIL;
-	bool* mr_keys = key_pool->mr_keys;
-	int num_mr_keys = key_pool->size;
-	pthread_mutex_t *lock = &key_pool->lock;
-
-	if (mr_keys == NULL) {
-		NCCL_OFI_WARN("Invalid call to allocate_mr_key");
-		return FI_KEY_NOTAVAIL;
-	}
-
-	pthread_mutex_lock(lock);
-
-	for (size_t i = 0; i < num_mr_keys; i++) {
-		if (mr_keys[i]) {
-			mr_keys[i] = false;
-			key = i;
-			break;
-		}
-	}
-
-	if (key == FI_KEY_NOTAVAIL)
-		NCCL_OFI_WARN("No MR keys available (max: %d)", num_mr_keys);
-
-	pthread_mutex_unlock(lock);
-	return key;
-}
-
-/*
- * @brief	Free a memory registration key
- *
- * Return input key into the key pool.
- *
- * This operation is locked by the key pool's internal lock.
- */
-ncclResult_t nccl_net_ofi_free_mr_key(nccl_ofi_mr_keypool_t *key_pool, uint64_t key)
-{
-	bool* mr_keys = key_pool->mr_keys;
-	int num_mr_keys = key_pool->size;
-	pthread_mutex_t *lock = &key_pool->lock;
-
-	if (mr_keys == NULL) {
-		NCCL_OFI_WARN("Invalid call to free_mr_key");
-		return ncclInternalError;
-	}
-
-	if (key >= num_mr_keys) {
-		NCCL_OFI_WARN("Key value out of range (%"PRIu64")", key);
-		return ncclInternalError;
-	}
-
-	if (mr_keys[key] != false) {
-		NCCL_OFI_WARN("Attempted to free a key that's not in use (%"PRIu64")", key);
-		return ncclInternalError;
-	}
-
-	pthread_mutex_lock(lock);
-
-	mr_keys[key] = true;
-
-	pthread_mutex_unlock(lock);
-
-	return ncclSuccess;
 }
 
 static int in_list(const char *item, const char *list)
@@ -386,7 +292,7 @@ static void filter_tcp_info_list(struct fi_info **info_list, int *num_infos)
 static void get_hints(struct fi_info *hints, int req_gdr)
 {
 	if (req_gdr) {
-		hints->caps = FI_TAGGED | FI_MSG | FI_HMEM | FI_REMOTE_COMM;
+		hints->caps = FI_TAGGED | FI_MSG | FI_HMEM;
 		if (!cuda_flush)
 			hints->caps |= FI_RMA | FI_READ;
 		/*
@@ -398,13 +304,15 @@ static void get_hints(struct fi_info *hints, int req_gdr)
 		hints->domain_attr->mr_key_size = (size_t) ofi_nccl_mr_key_size();
 	}
 	else {
-		hints->caps = FI_TAGGED | FI_MSG | FI_REMOTE_COMM;
+		hints->caps = FI_TAGGED | FI_MSG;
 		/*
 		 * Set MR mode bits to indicate that application allows
 		 * registration of both local memory buffers
 		 */
 		hints->domain_attr->mr_mode = FI_MR_LOCAL;
 	}
+
+	hints->caps |= FI_LOCAL_COMM | FI_REMOTE_COMM;
 
 	/*
 	 * Add capabilities needed for RDMA protcol:
@@ -609,12 +517,12 @@ static int get_ofi_provider(const char *prov_include, struct fi_info **prov_info
 	if (*num_prov_infos == 0)
 		goto error;
 
-	return ncclSuccess;
+	return 0;
 
  error:
 	if (providers)
 		fi_freeinfo(providers);
-	return ncclSystemError;
+	return -EINVAL;
 }
 
 /*
@@ -634,10 +542,10 @@ struct fi_info *get_nic_info(int dev_id, struct fi_info *info_list)
 	return nic_info;
 }
 
-ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *domain,
+int nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *domain,
 				      struct fid_ep **ep, struct fid_av **av, struct fid_cq **cq)
 {
-	ncclResult_t ret = ncclSuccess;
+	int ret = 0;
  	struct fi_av_attr av_attr = {0};
 	struct fi_cq_attr cq_attr = {0};
 
@@ -646,7 +554,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't allocate endpoint. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		ret = ncclSystemError;
 		goto error;
 	}
 
@@ -655,7 +562,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't open CQ. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		ret = ncclSystemError;
 		goto error;
 	}
 
@@ -664,7 +570,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't open AV. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		ret = ncclSystemError;
 		goto error;
 	}
 
@@ -673,7 +578,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't bind EP-CQ. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		ret = ncclSystemError;
 		goto error;
 	}
 
@@ -682,7 +586,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't bind EP-AV. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		ret = ncclSystemError;
 		goto error;
 	}
 
@@ -704,10 +607,9 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 				 * support GDR, we should just abort.
 				 */
 				NCCL_OFI_WARN("GDR support reported to NCCL but then couldn't be configured on an endpoint.  Cannot continue.");
-				ret = ncclSystemError;
 				goto error;
 			} else {
-				NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Could not disable CUDA API usage for HMEM, disabling GDR");
+				NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Could not disable CUDA API usage for HMEM, disabling GDR");
 				/* If we can't disable CUDA, then we don't really
 				 * have GDR, so disable GDR  support from the NCCL
 				 * point of view.
@@ -721,7 +623,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 		} else {
 			NCCL_OFI_WARN("Failed to set FI_OPT_CUDA_API_PERMITTED. RC: %d, ERROR: %s",
 				      ret, fi_strerror(-ret));
-			ret = ncclSystemError;
 			goto error;
 		}
 #elif HAVE_NEURON
@@ -735,7 +636,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 		support_gdr = GDR_SUPPORTED;
 #else
 		NCCL_OFI_WARN("Using Libfabric 1.18 API with GPUDirect RDMA support, and FI_OPT_CUDA_API_PERMITTED is not declared.");
-		ret = ncclSystemError;
 		goto error;
 #endif
 	}
@@ -751,7 +651,6 @@ ncclResult_t nccl_ofi_init_connection(struct fi_info *info, struct fid_domain *d
 	if (OFI_UNLIKELY(ret != 0)) {
 		NCCL_OFI_WARN("Couldn't enable endpoint. RC: %d, ERROR: %s",
 			      ret, fi_strerror(-ret));
-		ret = ncclSystemError;
 		goto error;
 	}
 
@@ -795,7 +694,7 @@ void nccl_ofi_ep_release_ofi(struct fid_ep *ep, struct fid_av *av, struct fid_cq
 /*
  * @brief Check if provider selects memory registration keys
  */
-ncclResult_t check_own_mr_keys_required(struct fi_info* ofi_info_list, bool *provide_own_mr_key)
+int check_own_mr_keys_required(struct fi_info* ofi_info_list, bool *provide_own_mr_key)
 {
 	if (!(ofi_info_list->caps & FI_RMA)) {
 		/* When FI_RMA is not requested, Libfabric considers
@@ -810,13 +709,13 @@ ncclResult_t check_own_mr_keys_required(struct fi_info* ofi_info_list, bool *pro
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s only configured for local registration.",
 			       ofi_info_list->fabric_attr->prov_name);
 		*provide_own_mr_key = false;
-		return ncclSuccess;
+		return 0;
 	}
 	else if (ofi_info_list->domain_attr->mr_mode & FI_MR_PROV_KEY) {
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s selects memory registration keys",
 			       ofi_info_list->fabric_attr->prov_name);
 		*provide_own_mr_key = false;
-		return ncclSuccess;
+		return 0;
 	}
 	else {
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s does not select memory registration keys",
@@ -827,19 +726,18 @@ ncclResult_t check_own_mr_keys_required(struct fi_info* ofi_info_list, bool *pro
 				      ofi_info_list->fabric_attr->prov_name,
 				      ofi_info_list->domain_attr->mr_key_size,
 				      ofi_nccl_mr_key_size());
-			return ncclSystemError;
+			return -EINVAL;
 		}
 
 		*provide_own_mr_key = true;
-		return ncclSuccess;
+		return 0;
 	}
 }
 
-ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
+int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t **plugin_p)
 {
-	ncclResult_t ret = ncclSuccess;
+	int ret = 0;
 
-	ofi_log_function = logFunction;
 	/* NICs info list for a provider */
 	struct fi_info* ofi_info_list = NULL;
 	/* Number of NICs */
@@ -847,33 +745,38 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 
 	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Initializing " PACKAGE_STRING);
 
+	/* Print Libfabric version */
+	uint32_t fab_version = fi_version();
+	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Using Libfabric version %u.%u", FI_MAJOR(fab_version),
+			FI_MINOR(fab_version));
+
 	system_page_size = sysconf(_SC_PAGESIZE);
 	if (OFI_UNLIKELY(system_page_size == -1)) {
 		NCCL_OFI_WARN("Failed to get system page size (%d %s)", errno, strerror(errno));
-		ret = ncclSystemError;
+		ret = -ENOTSUP;
 		goto exit;
 	}
 	assert(NCCL_OFI_IS_POWER_OF_TWO(system_page_size));
 	assert(system_page_size > 0);
 
 #if HAVE_CUDA
-	if (nccl_net_ofi_cuda_init() != 0) {
+	ret = nccl_net_ofi_cuda_init();
+	if (ret != 0) {
 		NCCL_OFI_WARN("CUDA initialization failed.");
-		ret = ncclSystemError;
 		goto exit;
 	}
 
 	int cuda_version;
-	if (nccl_net_ofi_cudaRuntimeGetVersion(&cuda_version) != cudaSuccess) {
-		NCCL_OFI_WARN("cudaRuntimeGetVersion failed");
-		ret = ncclSystemError;
+	if (nccl_net_ofi_cuDriverGetVersion(&cuda_version) != CUDA_SUCCESS) {
+		NCCL_OFI_WARN("cuDriverGetVersion failed");
+		ret = -ENOTSUP;
 		goto exit;
 	}
 
-	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Using CUDA runtime version %d", cuda_version);
+	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Using CUDA driver version %d", cuda_version);
 	if (ofi_nccl_cuda_flush_enable()) {
-		if (nccl_net_ofi_cudaDeviceFlushGPUDirectRDMAWrites == NULL) {
-			NCCL_OFI_WARN("CUDA flush requested, but cudaDeviceFlushGPUDIrectRDMAWrite not found.");
+		if (nccl_net_ofi_cuFlushGPUDirectRDMAWrites == NULL) {
+			NCCL_OFI_WARN("CUDA flush requested, but cuFlushGPUDirectRDMAWrites not found.");
 			cuda_flush = false;
 		} else {
 			NCCL_OFI_WARN("CUDA flush enabled");
@@ -887,14 +790,14 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 
 	if (platform_init) {
 		ret = platform_init();
-		if (ret != ncclSuccess)
+		if (ret != 0)
 			goto exit;
 	}
 
 	/* Get list of NICs fi_info structures for a single provider */
 	ret = get_ofi_provider(provider_filter, &ofi_info_list, &ofi_ndevices);
 	if (ret != 0 || ofi_info_list == NULL) {
-		ret = ncclSystemError;
+		ret = -ENOTSUP;
 		goto exit;
 	}
 
@@ -903,7 +806,7 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 		filter_tcp_info_list(&ofi_info_list, &ofi_ndevices);
 		if (ofi_info_list == NULL) {
 			NCCL_OFI_WARN("No viable endpoint found for TCP provider. Try and relax the filters using OFI_NCCL_USE_IPV6_TCP or OFI_NCCL_EXCLUDE_TCP_IF environment variables");
-			ret = ncclSystemError;
+			ret = -ENOTSUP;
 			goto exit;
 		}
 	}
@@ -980,6 +883,20 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Selected Provider is %s (found %d nics)",
 		      ofi_info_list->fabric_attr->prov_name, ofi_ndevices);
 
+	/* Prior to Libfabric 1.18.0, there was no way to disable
+	 * Libfabric from making CUDA calls.  While the EFA path was
+	 * CUDA clean, it could use the shm provider, which did make
+	 * CUDA calls.  Rather than muck with side channel ways of
+	 * disabling CUDA in old Libfabric, just require newer
+	 * Libfabric. */
+	if (strncmp("efa", ofi_info_list->fabric_attr->prov_name, strlen("efa")) == 0) {
+		if (FI_VERSION_LT(fi_version(), FI_VERSION(1, 18))) {
+			NCCL_OFI_WARN("EFA provider requires at least libfabric version 1.18.0.");
+			ret = -ENOTSUP;
+			goto exit;
+		}
+	}
+
 	/* Check if provider requires local memory registration */
 	if (ofi_info_list->domain_attr->mr_mode & FI_MR_LOCAL) {
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Provider %s requires registration of local memory buffers",
@@ -1003,7 +920,7 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 	/* Indicates if the provider selects MR keys */
 	bool provide_own_mr_key = true;
 	ret = check_own_mr_keys_required(ofi_info_list, &provide_own_mr_key);
-	if (ret != ncclSuccess) {
+	if (ret != 0) {
 		goto exit;
 	}
 
@@ -1031,9 +948,9 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 		int num_accelerators = ofi_ndevices;
 
 #if HAVE_CUDA
-		if (nccl_net_ofi_cudaGetDeviceCount(&num_accelerators) != cudaSuccess) {
+		if (nccl_net_ofi_cuDeviceGetCount(&num_accelerators) != CUDA_SUCCESS) {
 			NCCL_OFI_WARN("Error getting CUDA device count");
-			ret = ncclUnhandledCudaError;
+			ret = -ENOTSUP;
 			goto exit;
 		}
 #endif
@@ -1072,15 +989,16 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 			      nccl_ofi_selected_protocol);
 	}
 
-	if (0 == strcmp(nccl_ofi_selected_protocol, "SENDRECV")) {
+	if (0 == strcasecmp(nccl_ofi_selected_protocol, "SENDRECV")) {
 		ret = nccl_net_ofi_sendrecv_init(ofi_info_list, ofi_ndevices,
-						 provide_own_mr_key);
-		if (ret != ncclSuccess) {
+						 provide_own_mr_key,
+						 plugin_p);
+		if (ret != 0) {
 			NCCL_OFI_WARN("Failed to initialize sendrecv protocol");
 			ret = ncclInternalError;
 			goto exit;
 		}
-	} else if (0 == strcmp(nccl_ofi_selected_protocol, "RDMA")) {
+	} else if (0 == strcasecmp(nccl_ofi_selected_protocol, "RDMA")) {
 		/* NCCL OFI topology */
 		nccl_ofi_topo_t *topo = NULL;
 
@@ -1088,22 +1006,21 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 		topo = nccl_ofi_topo_create(ofi_info_list);
 		if (!topo) {
 			NCCL_OFI_WARN("Failed to create NCCL OFI topology");
-			ret = ncclInternalError;
+			ret = -ENOTSUP;
 			goto exit;
 		}
 
-		ret = nccl_net_ofi_rdma_init(topo, provide_own_mr_key);
+		ret = nccl_net_ofi_rdma_init(topo, provide_own_mr_key, plugin_p);
 
 		nccl_ofi_topo_free(topo);
 
 		if (ret != ncclSuccess) {
 			NCCL_OFI_WARN("Failed to initialize rdma protocol");
-			ret = ncclInternalError;
 			goto exit;
 		}
 	} else {
 		NCCL_OFI_WARN("Unable to find plugin protocol %s", nccl_ofi_selected_protocol);
-		ret = ncclInternalError;
+		ret = -ENOTSUP;
 		goto exit;
 	}
 
@@ -1119,15 +1036,15 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 	 * does not matter which device is used to create the endpoint.
 	 */
 	int dev_id = 0;
-	nccl_net_ofi_device_t *base_dev = plugin->devs[dev_id];
+	nccl_net_ofi_device_t *base_dev = (*plugin_p)->devs[dev_id];
 	nccl_net_ofi_ep_t *base_ep = NULL;
 
-	ret = plugin->devs[dev_id]->get_ep(base_dev, &base_ep);
-	if (OFI_UNLIKELY(ret != ncclSuccess)) {
+	ret = (*plugin_p)->devs[dev_id]->get_ep(base_dev, &base_ep);
+	if (ret != 0) {
 		goto exit;
 	}
 	ret = base_ep->release_ep(base_ep);
-	if (OFI_UNLIKELY(ret != ncclSuccess)) {
+	if (ret != 0) {
 		goto exit;
 	}
 
@@ -1139,62 +1056,51 @@ ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t logFunction)
 	 */
 	if (nic_dup_conns > 0 && support_gdr != GDR_UNSUPPORTED) {
 		NCCL_OFI_WARN("NCCL_OFI_NIC_DUP_CONNS set on platform that supports GPUDirect RDMA.  This configuration is not supported.");
-		ret = ncclSystemError;
+		ret = -ENOTSUP;
 		goto exit;
 	}
 
  exit:
 	nccl_net_ofi_free_info_list(ofi_info_list);
 
-	if (ret != ncclSuccess) {
+	if (ret != 0) {
 		NCCL_OFI_WARN(PACKAGE_NAME " initialization failed");
 	}
 	return ret;
 }
 
-ncclResult_t nccl_net_ofi_devices(int *num_devices)
+static int get_device_pci_path(struct fid_nic *nic_info, char** path)
 {
-	/* Validate plugin */
-	if (OFI_UNLIKELY(plugin == NULL)) {
-		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
-		return ncclInvalidUsage;
-	}
-
-	*num_devices = plugin->num_devs;
-	return ncclSuccess;
-}
-
-static ncclResult_t get_device_pci_path(struct fid_nic *nic_info, char** path)
-{
-	ncclResult_t ret = ncclSuccess;
+	int ret = 0;
 	struct fi_pci_attr *pci = NULL;
 	char *device_path = NULL;
-	int ret_int;
 
 	if (nic_info->bus_attr->bus_type != FI_BUS_PCI) {
 		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET,
 			      "Invalid type of PCI bus returned %d",
 			      nic_info->bus_attr->bus_type);
-		ret = ncclSystemError;
+		ret = -EINVAL;;
 		goto exit;
 	}
 
 	pci = &nic_info->bus_attr->attr.pci;
-	ret_int = asprintf(&device_path,
-			   "/sys/class/pci_bus/%04x:%02x/../../%04x:%02x:%02x.%01x",
-			   pci->domain_id, pci->bus_id,
-			   pci->domain_id, pci->bus_id, pci->device_id, pci->function_id);
-	if (ret_int < 0) {
+	ret = asprintf(&device_path,
+		       "/sys/class/pci_bus/%04x:%02x/../../%04x:%02x:%02x.%01x",
+		       pci->domain_id, pci->bus_id,
+		       pci->domain_id, pci->bus_id, pci->device_id, pci->function_id);
+	if (ret < 0) {
 		NCCL_OFI_WARN("pciPath: Allocation failure");
-		ret = ncclSystemError;
+		ret = -ENOMEM;
 		goto exit;
+	} else {
+		ret = 0;
 	}
 
 	*path = realpath(device_path, NULL);
 	if (*path == NULL) {
 		NCCL_OFI_WARN("pciPath: Could not find real path of %s",
 			      device_path);
-		ret = ncclSystemError;
+		ret = -errno;
 		goto exit;
 	}
 
@@ -1208,11 +1114,9 @@ static ncclResult_t get_device_pci_path(struct fid_nic *nic_info, char** path)
 /*
  * @brief	Set default properties for libfabric NIC info.
  */
-static ncclResult_t set_nic_props_default(int dev_id, struct fi_info *nic_prov,
-					  ncclNetProperties_t *props)
+static int set_nic_props_default(int dev_id, struct fi_info *nic_prov,
+				 nccl_ofi_properties_t *props)
 {
-	ncclResult_t ret = ncclSuccess;
-
 	props->name = strdup(nic_prov->domain_attr->name);
 
 	/*
@@ -1220,8 +1124,8 @@ static ncclResult_t set_nic_props_default(int dev_id, struct fi_info *nic_prov,
 	 * objects for devices with multiple ports. So, safely assume port number
 	 * to be always 1.
 	 */
-	props->port = 1;
-	props->maxComms = nic_prov->domain_attr->ep_cnt;
+	props->port_number = 1;
+	props->max_communicators = 0;
 	props->guid = dev_id;
 
 	props->latency = net_latency >= .0 ? net_latency : .0;
@@ -1236,20 +1140,18 @@ static ncclResult_t set_nic_props_default(int dev_id, struct fi_info *nic_prov,
 	 * impacted with this feature as NCCL doesn't aggregate receives from
 	 * same source.
 	 */
-	props->maxRecvs = NCCL_OFI_MAX_RECVS;
+	props->max_group_receives = NCCL_OFI_MAX_RECVS;
 
-	props->ptrSupport = NCCL_PTR_HOST;
 	if (support_gdr == GDR_SUPPORTED) {
-		/* Supports message transfer from both CUDA and HOST buffers */
-#if HAVE_CUDA
-		props->ptrSupport |= NCCL_PTR_CUDA;
-#elif HAVE_NEURON
-		props->ptrSupport |= NCCL_PTR_NEURON;
-#endif
+		props->hmem_support = true;
+	} else {
+		props->hmem_support = false;
 	}
 
+	props->dmabuf_support = false;
+
 	/* Should be successful for ptrSupport invocation */
-	return ret;
+	return 0;
 }
 
 /*
@@ -1257,14 +1159,15 @@ static ncclResult_t set_nic_props_default(int dev_id, struct fi_info *nic_prov,
  *
  * @return	Populated props structure
  */
-ncclResult_t nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, int num_devices, ncclNetProperties_t *props)
+int nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, int num_devices,
+				 nccl_ofi_properties_t *props)
 {
-	ncclResult_t ret = ncclSuccess;
-	ncclNetProperties_t dev_props = {0};
+	int ret = 0;
+	nccl_ofi_properties_t dev_props = {0};
 	struct fid_nic *nic_info = NULL;
 
 	ret = set_nic_props_default(dev_id, nic_prov, &dev_props);
-	if (ret != ncclSuccess)
+	if (ret != 0)
 		goto error;
 
 	/* Change default values as set by NIC attributes */
@@ -1273,6 +1176,7 @@ ncclResult_t nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, 
 		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET,
 			      "No NIC info for dev %d. Supplying default values for NIC properties.",
 			      dev_id);
+		ret = 0;
 		goto exit;
 	}
 
@@ -1283,26 +1187,28 @@ ncclResult_t nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, 
 	}
 
 	/* Speed reported in Mbps */
-	dev_props.speed = nic_info->link_attr->speed / (1e6);
+	dev_props.port_speed = nic_info->link_attr->speed / (1e6);
 
-	ret = get_device_pci_path(nic_info, &(dev_props.pciPath));
-	if (ret != ncclSuccess)
-		props->pciPath = NULL;
+	ret = get_device_pci_path(nic_info, &(dev_props.pci_path));
+	if (ret != ncclSuccess) {
+		ret = 0;
+		props->pci_path = NULL;
+	}
 
 	if (nic_dup_conns > 1) {
 #if HAVE_CUDA
 		int num_gpus_visible, active_cuda_device, gpus_per_conn;
 		size_t c;
 
-		if (nccl_net_ofi_cudaGetDeviceCount(&num_gpus_visible) != cudaSuccess) {
+		if (nccl_net_ofi_cuDeviceGetCount(&num_gpus_visible) != CUDA_SUCCESS) {
 			NCCL_OFI_WARN("Error getting CUDA device count");
-			ret = ncclUnhandledCudaError;
+			ret = -ENOTSUP;
 			goto error;
 		}
 
-		if (nccl_net_ofi_cudaGetDevice(&active_cuda_device) != cudaSuccess) {
+		if (nccl_net_ofi_cuCtxGetDevice(&active_cuda_device) != CUDA_SUCCESS) {
 			NCCL_OFI_WARN("Error getting current CUDA device");
-			ret = ncclUnhandledCudaError;
+			ret = -ENOTSUP;
 			goto error;
 		}
 
@@ -1313,7 +1219,7 @@ ncclResult_t nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, 
 		 * system think that any given virtual nic is the one
 		 * that they should use, and that it is different than
 		 * the other NICs in the system.  We do this by only
-		 * leaving a valid device id in pciPath when
+		 * leaving a valid device id in pci_path when
 		 * active_cuda_device / gpus_per_comm is equal to the
 		 * NIC dev index we're currently querying.  For the
 		 * others, we provide a PCIPath that points at the PCI
@@ -1329,20 +1235,20 @@ ncclResult_t nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, 
 		 * bouncing through host buffers anyway.
 		 */
 		if (active_cuda_device / gpus_per_conn  != dev_id) {
-			for (c=strlen(dev_props.pciPath); c && dev_props.pciPath[c] != '/'; c--) {
-				dev_props.pciPath[c] = '\0';
+			for (c=strlen(dev_props.pci_path); c && dev_props.pci_path[c] != '/'; c--) {
+				dev_props.pci_path[c] = '\0';
 			}
-			dev_props.pciPath[c] = '\0';
+			dev_props.pci_path[c] = '\0';
 		}
 		NCCL_OFI_TRACE(NCCL_INIT, "Returning synthetic PCI path for device %d of  %s",
-			       dev_id, dev_props.pciPath);
+			       dev_id, dev_props.pci_path);
 
 		snprintf(dev_props.name, FI_NAME_MAX + 2, "%s-%x", nic_info->device_attr->name, dev_id);
 		NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Adjusted dev %d device name to %s",
 			       dev_id, dev_props.name);
 #else
 		NCCL_OFI_WARN("NIC_DUP_CONNS enabled on platform that does not support NIC_DUP_CONNS.  This should not happen.");
-		ret = ncclSystemError;
+		ret = -ENOTSUP;
 		goto error;
 #endif
 	}
@@ -1356,515 +1262,19 @@ ncclResult_t nccl_net_ofi_info_properties(struct fi_info *nic_prov, int dev_id, 
 	return ret;
 }
 
-ncclResult_t nccl_net_ofi_getProperties(int dev_id, ncclNetProperties_t *props)
+
+int nccl_net_ofi_reg_mr_dma_buf_send_comm(nccl_net_ofi_send_comm_t *send_comm,
+					  void *data, size_t size,
+					  int type, uint64_t offset, int fd,
+					  nccl_net_ofi_mr_handle_t **handle)
 {
-	/* Validate plugin */
-	if (OFI_UNLIKELY(plugin == NULL)) {
-		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
-		return ncclInvalidUsage;
-	}
-
-	/* Validate dev parameter */
-	if (OFI_UNLIKELY(dev_id < 0 || dev_id >= plugin->num_devs)) {
-		NCCL_OFI_WARN("Incorrect dev %d provided", dev_id);
-		return ncclInternalError;
-	}
-
-	/* Validate devices */
-	if (OFI_UNLIKELY(plugin->devs == NULL)) {
-		NCCL_OFI_WARN("Error accessing devices array. Devices array has not been initialized.");
-		return ncclInternalError;
-	}
-
-	/* Validate device */
-	if (OFI_UNLIKELY(plugin->devs[dev_id] == NULL)) {
-		NCCL_OFI_WARN("Error accessing device. Device #%i has not been initialized.", dev_id);
-		return ncclInternalError;
-	}
-
-	int num_devices = plugin->num_devs;
-	return plugin->devs[dev_id]->get_properties(num_devices, plugin->devs[dev_id], props);
+	return -ENOTSUP;
 }
 
-ncclResult_t nccl_net_ofi_listen(int dev_id, void *handle, void **lComm)
+int nccl_net_ofi_reg_mr_dma_buf_recv_comm(nccl_net_ofi_recv_comm_t *recv_comm,
+					  void *data, size_t size,
+					  int type, uint64_t offset, int fd,
+					  nccl_net_ofi_mr_handle_t **handle)
 {
-	ncclResult_t ret = ncclSuccess;
-	nccl_net_ofi_device_t *base_dev = NULL;
-	nccl_net_ofi_ep_t *base_ep = NULL;
-	nccl_net_ofi_listen_comm_t **listen_comm =
-		(nccl_net_ofi_listen_comm_t **)lComm;
-
-	/* Validate plugin */
-	if (OFI_UNLIKELY(plugin == NULL)) {
-		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
-		return ncclInvalidUsage;
-	}
-
-	/* Validate dev_id parameter */
-	if (OFI_UNLIKELY(dev_id < 0 || dev_id >= plugin->num_devs)) {
-		NCCL_OFI_WARN("Incorrect device ID %d provided. "
-			      "Correct values are from 0 to %d",
-			      dev_id, plugin->num_devs - 1);
-		return ncclInternalError;
-	}
-
-	/* Validate devices */
-	if (OFI_UNLIKELY(plugin->devs == NULL)) {
-		NCCL_OFI_WARN("Error accessing devices array. Devices array has not been initialized.");
-		return ncclInternalError;
-	}
-
-	/* Retrieve and validate device */
-	base_dev = plugin->devs[dev_id];
-	if (OFI_UNLIKELY(base_dev == NULL)) {
-		NCCL_OFI_WARN("Error accessing device. Device #%i has not been initialized.", dev_id);
-		return ncclInternalError;
-	}
-
-	/* Validate Handle */
-	if (OFI_UNLIKELY(handle == NULL)) {
-		NCCL_OFI_WARN("Provided handle is NULL");
-		return ncclInvalidArgument;
-	}
-
-	/* Retrieve and validate endpoint */
-	plugin->devs[dev_id]->get_ep(base_dev, &base_ep);
-	if (OFI_UNLIKELY(base_ep == NULL)) {
-		NCCL_OFI_WARN("Error accessing endpoint. Endpoint has not been initialized.");
-		return ncclInternalError;
-	}
-
-	ret = base_ep->listen(base_ep, handle, listen_comm);
-
-	if (ret != ncclSuccess) {
-		base_ep->release_ep(base_ep);
-	}
-	return ret;
-}
-
-/*
- * @brief	Non-blocking connect which returns sComm as NULL
- *		with an expectation that it will be called again until 
- *		sComm != NULL
- *
- * The callee obtains one endpoint handle via the device's get_ep()
- * function for each specific handle.  Further invocations of this
- * function with the same handle assume that the endpoint in question
- * is stored in the communicator which itself is referable from the
- * communicator state's struct of the handle.  Also, the callee
- * invokes connect() on the endpoint. If this endpoint connect()
- * function returns a value different from ncclSuccess, the callee
- * releases the handle via release_ep(). When connect() succeeds, the
- * function nccl_net_ofi_closeSend() is responsible for releasing the
- * endpoint handle by invoking release_ep().
- *
- * @param	Network Device ID
- * 		Connection Handle (transferred OOB by NCCL)
- *
- * @return	sComm = NULL, if connection hasn't been established
- * 		sComm != NULL, once connection is established
- * @return	0, on success
- * 		error, on others
- */
-ncclResult_t nccl_net_ofi_connect(int dev_id, void *handle, void **sComm)
-{
-	/* Validate plugin */
-	if (OFI_UNLIKELY(plugin == NULL)) {
-		NCCL_OFI_WARN("Error accessing plugin. Plugin has not been initialized yet.");
-		return ncclInvalidArgument;
-	}
-
-	/* Validate dev_id parameter */
-	if (OFI_UNLIKELY(dev_id < 0 || dev_id >= plugin->num_devs)) {
-		NCCL_OFI_WARN("Incorrect device ID %d provided. "
-			      "Correct values are from 0 to %d",
-			      dev_id, plugin->num_devs - 1);
-		return ncclInternalError;
-	}
-
-	/* Validate devices */
-	if (OFI_UNLIKELY(plugin->devs == NULL)) {
-		NCCL_OFI_WARN("Error accessing devices array. Devices array has not been initialized.");
-		return ncclInternalError;
-	}
-
-	/* Retrieve and validate Handle */
-	nccl_net_ofi_conn_handle_t *ofi_handle =
-		(nccl_net_ofi_conn_handle_t *)handle;
-	if (OFI_UNLIKELY(ofi_handle == NULL)) {
-		NCCL_OFI_WARN("Provided handle is NULL");
-		return ncclInvalidArgument;
-	}
-
-	/* Retrieve and validate endpoint */
-	nccl_net_ofi_ep_t *base_ep = NULL;
-	if (ofi_handle->state.stage == COMM_CREATE_START) {
-		/* Retrieve and validate device */
-		nccl_net_ofi_device_t *base_dev = base_dev = plugin->devs[dev_id];
-		if (OFI_UNLIKELY(base_dev == NULL)) {
-			NCCL_OFI_WARN("Error accessing device. Device #%i has not been initialized.", dev_id);
-			return ncclInternalError;
-		}
-
-		ncclResult_t ret = base_dev->get_ep(base_dev, &base_ep);
-		if (OFI_UNLIKELY(ret != ncclSuccess)) {
-			return ret;
-		}
-	} else {
-		base_ep = ofi_handle->state.comm->ep;
-		if (OFI_UNLIKELY(base_ep == NULL)) {
-			NCCL_OFI_WARN("Error accessing endpoint. Endpoint has not been initialized.");
-			return ncclInternalError;
-		}
-	}
-
-	/* Connect */
-	nccl_net_ofi_send_comm_t **send_comm =
-		(nccl_net_ofi_send_comm_t **)sComm;
-	ncclResult_t ret = base_ep->connect(base_ep, handle, send_comm);
-
-	if (OFI_UNLIKELY(ret != ncclSuccess)) {
-		base_ep->release_ep(base_ep);
-	}
-
-	return ret;
-
-}
-
-#if HAVE_NEURON
-ncclResult_t nccl_net_ofi_regMr(void *comm, void *data, size_t size, int type,
-#elif HAVE_CUDA
-ncclResult_t nccl_net_ofi_regMr(void *comm, void *data, int size, int type,
-#endif
-				void **mhandle)
-{
-	/* Retrieve and validate comm */
-	nccl_net_ofi_comm_t *base_comm =
-		(nccl_net_ofi_comm_t *)comm;
-	if (OFI_UNLIKELY(base_comm == NULL)) {
-		NCCL_OFI_WARN("Invalid comm object provided");
-		return ncclInternalError;
-	}
-
-	ncclResult_t ret = ncclSuccess;
-
-	switch (base_comm->type) {
-	case NCCL_NET_OFI_SEND_COMM:;
-		nccl_net_ofi_send_comm_t *send_comm =
-			(nccl_net_ofi_send_comm_t *)base_comm;
-		ret = send_comm->regMr(send_comm, data, size, type, mhandle);
-		break;
-	case NCCL_NET_OFI_RECV_COMM:;
-		nccl_net_ofi_recv_comm_t *recv_comm =
-			(nccl_net_ofi_recv_comm_t *)base_comm;
-		ret = recv_comm->regMr(recv_comm, data, size, type, mhandle);
-		break;
-	default:
-		NCCL_OFI_WARN("Unexpected communicator type. Communicator type: %d",
-			      base_comm->type);
-		ret = ncclInvalidUsage;
-		break;
-	}
-
-	return ret;
-}
-
-ncclResult_t nccl_net_ofi_deregMr(void *comm, void *mhandle)
-{
-	/* Retrieve and validate comm */
-	nccl_net_ofi_comm_t *base_comm =
-		(nccl_net_ofi_comm_t *)comm;
-	if (OFI_UNLIKELY(base_comm == NULL)) {
-		NCCL_OFI_WARN("Invalid comm object provided");
-		return ncclInternalError;
-	}
-
-	ncclResult_t ret = ncclSuccess;
-
-	switch (base_comm->type) {
-	case NCCL_NET_OFI_SEND_COMM:;
-		nccl_net_ofi_send_comm_t *send_comm =
-			(nccl_net_ofi_send_comm_t *)base_comm;
-		ret = send_comm->deregMr(send_comm, mhandle);
-		break;
-	case NCCL_NET_OFI_RECV_COMM:;
-		nccl_net_ofi_recv_comm_t *recv_comm =
-			(nccl_net_ofi_recv_comm_t *)base_comm;
-		ret = recv_comm->deregMr(recv_comm, mhandle);
-		break;
-	default:
-		NCCL_OFI_WARN("Unexpected communicator type. Communicator type: %d",
-			      base_comm->type);
-		ret = ncclInvalidUsage;
-		break;
-	}
-
-	return ret;
-}
-
-ncclResult_t nccl_net_ofi_regMrDmaBuf(void* comm, void* data, size_t size,
-				      int type, uint64_t offset,
-				      int fd, void** mhandle)
-{
-	/* Retrieve and validate comm */
-	nccl_net_ofi_comm_t *base_comm =
-		(nccl_net_ofi_comm_t *)comm;
-	if (OFI_UNLIKELY(base_comm == NULL)) {
-		NCCL_OFI_WARN("Invalid comm object provided");
-		return ncclInternalError;
-	}
-
-	ncclResult_t ret = ncclSuccess;
-	nccl_net_ofi_mr_handle_t **handle = (nccl_net_ofi_mr_handle_t **)mhandle;
-
-	switch (base_comm->type) {
-	case NCCL_NET_OFI_SEND_COMM:;
-		nccl_net_ofi_send_comm_t *send_comm =
-			(nccl_net_ofi_send_comm_t *)base_comm;
-		ret = send_comm->regMrDmaBuf(send_comm, data, size, type, offset, fd, handle);
-		break;
-	case NCCL_NET_OFI_RECV_COMM:;
-		nccl_net_ofi_recv_comm_t *recv_comm =
-			(nccl_net_ofi_recv_comm_t *)base_comm;
-		ret = recv_comm->regMrDmaBuf(recv_comm, data, size, type, offset, fd, handle);
-		break;
-	default:
-		NCCL_OFI_WARN("Unexpected communicator type. Communicator type: %d",
-			      base_comm->type);
-		ret = ncclInvalidUsage;
-		break;
-	}
-
-	return ret;
-}
-
-ncclResult_t nccl_net_ofi_reg_mr_dma_buf_send_comm(nccl_net_ofi_send_comm_t *send_comm,
-						   void *data, size_t size,
-						   int type, uint64_t offset, int fd,
-						   nccl_net_ofi_mr_handle_t **handle)
-{
-	return ncclInternalError;
-}
-
-ncclResult_t nccl_net_ofi_reg_mr_dma_buf_recv_comm(nccl_net_ofi_recv_comm_t *recv_comm,
-						   void *data, size_t size,
-						   int type, uint64_t offset, int fd,
-						   nccl_net_ofi_mr_handle_t **handle)
-{
-	return ncclInternalError;
-}
-
-/*
- * @brief	Non-blocking accept which returns rComm as NULL
- * 		with an expectation that it will be called again until
- * 		rComm != NULL
- *
- * If accept fails by returning a result other than ncclSuccess,
- * release_ep() is invoked on the listen communicator's endpoint.
- *
- * @param	Listen Communicator object
- *
- * @return	rComm = NULL, if connection hasn't been established
- * 		rComm != NULL, once connection is established
- * @return	0, on success
- * 		error, on others
- */
-ncclResult_t nccl_net_ofi_accept(void *lComm, void **rComm)
-{
-	/* Verify communicator */
-	if (lComm == NULL) {
-		NCCL_OFI_WARN("Invalid listen communicator provided");
-		return ncclInternalError;
-	}
-
-	/* Invoke listen communicator accept() function */
-	nccl_net_ofi_listen_comm_t *listen_comm =
-		(nccl_net_ofi_listen_comm_t *)lComm;
-	nccl_net_ofi_recv_comm_t **recv_comm =
-		(nccl_net_ofi_recv_comm_t **)rComm;
-	ncclResult_t ret = listen_comm->accept(listen_comm, recv_comm);
-
-	/* Invoke release_ep() on listen comm's endpoint since accept failed */
-	if (OFI_UNLIKELY(ret != ncclSuccess)) {
-		/* Retrieve and validate endpoint */
-		nccl_net_ofi_ep_t *ep =
-			listen_comm->base.ep;
-		if (OFI_UNLIKELY(ep == NULL)) {
-			NCCL_OFI_WARN("Invalid endpoint provided");
-			return ret;
-		}
-		ep->release_ep(ep);
-	}
-
-	return ret;
-}
-
-ncclResult_t nccl_net_ofi_isend(void *sComm, void* data, int size,
-				int tag, void *mhandle, void** req)
-{
-	/* Validate send_comm */
-	if (OFI_UNLIKELY(sComm == NULL)) {
-		NCCL_OFI_WARN("Invalid send_comm provided");
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_send_comm_t *send_comm =
-		(nccl_net_ofi_send_comm_t *)sComm;
-	nccl_net_ofi_mr_handle_t *handle = (nccl_net_ofi_mr_handle_t *)mhandle;
-	nccl_net_ofi_req_t **base_req = (nccl_net_ofi_req_t **)req;
-
-	return send_comm->send(send_comm, data, size, tag, handle, base_req);
-}
-
-ncclResult_t nccl_net_ofi_irecv(void* rComm, int n, void** buffers, int* sizes,
-				int *tags, void** mhandles, void** req)
-{
-	/* Retrieve and validate comm */
-	nccl_net_ofi_recv_comm_t *recv_comm =
-		(nccl_net_ofi_recv_comm_t *)rComm;
-	if (OFI_UNLIKELY(recv_comm == NULL)) {
-		NCCL_OFI_WARN("Invalid comm object provided");
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_mr_handle_t **handles = (nccl_net_ofi_mr_handle_t **)mhandles;
-	nccl_net_ofi_req_t **base_req = (nccl_net_ofi_req_t **)req;
-
-	return recv_comm->recv(recv_comm, n, buffers, sizes, tags, handles, base_req);
-}
-
-ncclResult_t nccl_net_ofi_test(void* req, int* done, int* size)
-{
-	/* Validate request */
-	if (OFI_UNLIKELY(req == NULL)) {
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_req_t *base_req = (nccl_net_ofi_req_t *)req;
-	return base_req->test(base_req, done, size);
-}
-
-ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
-				 void** mhandles, void** req)
-{
-
-	/* Retrieve and validate recv_comm */
-	nccl_net_ofi_recv_comm_t *recv_comm =
-		(nccl_net_ofi_recv_comm_t *)rComm;
-	if (OFI_UNLIKELY(recv_comm == NULL)) {
-		NCCL_OFI_WARN("Invalid recv_comm provided");
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_mr_handle_t **handles = (nccl_net_ofi_mr_handle_t **)mhandles;
-	nccl_net_ofi_req_t **base_req = (nccl_net_ofi_req_t **)req;
-
-	return recv_comm->flush(recv_comm, n, buffers, sizes, handles, base_req);
-}
-
-/*
- * @brief	Destroy send communicator and invokes release_ep on its endpoint.
- */
-ncclResult_t nccl_net_ofi_closeSend(void *sComm)
-{
-	if (OFI_UNLIKELY(sComm == NULL)) {
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_send_comm_t *send_comm = (nccl_net_ofi_send_comm_t *)sComm;
-
-	/* Retrieve and validate endpoint */
-	nccl_net_ofi_ep_t *base_ep = (nccl_net_ofi_ep_t *)send_comm->base.ep;
-	if (OFI_UNLIKELY(base_ep == NULL)) {
-		NCCL_OFI_WARN("Invalid endpoint provided");
-		return ncclInternalError;
-	}
-
-	ncclResult_t ret = send_comm->close(send_comm);
-	if (ret != ncclSuccess) {
-		return ret;
-	}
-
-	return base_ep->release_ep(base_ep);
-}
-
-/*
- * @brief	Destroy receive communicator and invokes release_ep on its endpoint.
- */
-ncclResult_t nccl_net_ofi_closeRecv(void *rComm)
-{
-	if (OFI_UNLIKELY(rComm == NULL)) {
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_recv_comm_t *recv_comm = (nccl_net_ofi_recv_comm_t *)rComm;
-
-	/* Retrieve and validate endpoint */
-	nccl_net_ofi_ep_t *base_ep = (nccl_net_ofi_ep_t *)recv_comm->base.ep;
-	if (OFI_UNLIKELY(base_ep == NULL)) {
-		NCCL_OFI_WARN("Invalid endpoint provided");
-		return ncclInternalError;
-	}
-
-	ncclResult_t ret = recv_comm->close(recv_comm);
-	if (ret != ncclSuccess) {
-		return ret;
-	}
-
-	return base_ep->release_ep(base_ep);
-}
-
-ncclResult_t nccl_net_ofi_closeListen(void *lComm)
-{
-	if (OFI_UNLIKELY(lComm == NULL)) {
-		return ncclInternalError;
-	}
-
-	nccl_net_ofi_listen_comm_t *listen_comm =
-		(nccl_net_ofi_listen_comm_t *)lComm;
-
-	return listen_comm->close(listen_comm);
-}
-
-void nccl_net_ofi_init_plugin(nccl_net_ofi_device_t **base_devs,
-				     int num_infos) {
-	plugin->devs = base_devs;
-	plugin->num_devs = num_infos;
-}
-
-ncclResult_t nccl_ofi_mr_keys_init(nccl_ofi_mr_keypool_t *key_pool, bool provide_mr_keys)
-{
-	if (provide_mr_keys) {
-		/* The provider may return support for a larger key size. Use
-		 * the size requested by the user to allow them to limit the
-		 * size of the mr_keys table. */
-		key_pool->size = (size_t) 1 << (ofi_nccl_mr_key_size() * 8);
-		key_pool->mr_keys = malloc(sizeof(bool) * key_pool->size);
-
-		/* Return in case of allocation error */
-		if (NULL == key_pool->mr_keys) {
-			NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET, "Unable to allocate MR keys table");
-			return  ncclSystemError;
-		}
-
-		/* Set keys to be vacant */
-		for (size_t i = 0; i < key_pool->size; i++) {
-			key_pool->mr_keys[i] = true;
-		}
-
-		/* Intiaialize mutex for endpoint access */
-		if (pthread_mutex_init(&key_pool->lock, NULL)) {
-			NCCL_OFI_TRACE(NCCL_INIT | NCCL_NET,
-				       "Unable to initialize mutex");
-			free(key_pool->mr_keys);
-			return ncclSystemError;
-		}
-	}
-	else {
-		/* Mark key pool as not in use */
-		key_pool->size = 0;
-		key_pool->mr_keys = NULL;
-	}
-
-	return ncclSuccess;
+	return -ENOTSUP;
 }

@@ -21,7 +21,8 @@ int main(int argc, char* argv[])
 	nccl_net_ofi_send_comm_t *sComm = NULL;
 	nccl_net_ofi_listen_comm_t *lComm = NULL;
 	nccl_net_ofi_recv_comm_t *rComm = NULL;
-	ncclNet_t *extNet = NULL;
+	test_nccl_net_t *extNet = NULL;
+	ncclNetDeviceHandle_v7_t *s_ignore, *r_ignore;
 	char src_handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
 
 	ofi_log_function = logger;
@@ -49,6 +50,12 @@ int main(int argc, char* argv[])
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
+	if (num_ranks != 2) {
+		NCCL_OFI_WARN("Expected two ranks but got %d. "
+			"The nccl_message_transfer functional test should be run with exactly two ranks.",
+			num_ranks);
+		return 1;
+	}
 
 	char all_proc_name[num_ranks][MPI_MAX_PROCESSOR_NAME];
 
@@ -68,12 +75,16 @@ int main(int argc, char* argv[])
 	/* Set CUDA device for subsequent device memory allocation, in case GDR is used */
 	cuda_dev = local_rank;
 	NCCL_OFI_TRACE(NCCL_NET, "Using CUDA device %d for memory allocation", cuda_dev);
-	CUDACHECK(cudaSetDevice(cuda_dev));
+
+	CUDACHECK(cuInit(0));
+	CUcontext context;
+	CUDACHECK(cuCtxCreate(&context, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, cuda_dev));
+	CUDACHECK(cuCtxSetCurrent(context));
 
 	/* Get external Network from NCCL-OFI library */
 	extNet = get_extNet();
 	if (extNet == NULL)
-		return -1;
+		return 1;
 
 	/* Init API */
 	OFINCCLCHECK(extNet->init(&logger));
@@ -89,7 +100,7 @@ int main(int argc, char* argv[])
 
 	/* Get Properties for the device */
 	for (dev = 0; dev < ndev; dev++) {
-		ncclNetProperties_t props = {0};
+		test_nccl_properties_t props = {0};
 		OFINCCLCHECK(extNet->getProperties(dev, &props));
 		print_dev_props(dev, &props);
 
@@ -124,13 +135,13 @@ int main(int argc, char* argv[])
 		/* Connect API */
 		NCCL_OFI_INFO(NCCL_NET, "Send connection request to rank %d", rank + 1);
 		while (sComm == NULL) {
-			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm));
+			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm, &s_ignore));
 		}
 
 		/* Accept API */
 		NCCL_OFI_INFO(NCCL_NET, "Server: Start accepting requests");
 		while (rComm == NULL) {
-			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm));
+			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm, &r_ignore));
 		}
 		NCCL_OFI_INFO(NCCL_NET, "Successfully accepted connection from rank %d",
 				rank + 1);
@@ -166,13 +177,13 @@ int main(int argc, char* argv[])
 		/* Connect API */
 		NCCL_OFI_INFO(NCCL_NET, "Send connection request to rank %d", rank - 1);
 		while (sComm == NULL) {
-			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm));
+			OFINCCLCHECK(extNet->connect(dev, (void *)src_handle, (void **)&sComm, &s_ignore));
 		}
 
 		/* Accept API */
 		NCCL_OFI_INFO(NCCL_NET, "Server: Start accepting requests");
 		while (rComm == NULL) {
-			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm));
+			OFINCCLCHECK(extNet->accept((void *)lComm, (void **)&rComm, &r_ignore));
 		}
 		NCCL_OFI_INFO(NCCL_NET, "Successfully accepted connection from rank %d",
 				rank - 1);

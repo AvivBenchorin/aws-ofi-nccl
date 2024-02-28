@@ -20,6 +20,7 @@ extern "C" {
 #include "nccl_ofi_topo.h"
 #include "nccl_ofi_deque.h"
 #include "nccl_ofi_freelist.h"
+#include "nccl_ofi_idpool.h"
 
 /* Maximum number of rails supported. This defines the size of
  * messages exchanged during connection establishment (linear
@@ -87,9 +88,14 @@ typedef struct nccl_net_ofi_rdma_ctrl_fl_item {
 	nccl_net_ofi_rdma_ctrl_msg_t ctrl_msg;
 } nccl_net_ofi_rdma_ctrl_fl_item_t;
 
+/* For LL/LL128 protocols, bounce buffers (source of RDMA read operations) need to be 128B aligned */
+#define BOUNCE_BUFFER_ALIGNMENT 128
+
 /* Structure used to store bounce buffers in a free list */
 typedef struct nccl_net_ofi_rdma_bounce_fl_item {
 	nccl_ofi_freelist_reginfo_t fl_reginfo;
+#define PADDING_SIZE (BOUNCE_BUFFER_ALIGNMENT - (sizeof(nccl_ofi_freelist_reginfo_t) % BOUNCE_BUFFER_ALIGNMENT))
+	char padding[PADDING_SIZE];
 	char bounce_msg[];
 } nccl_net_ofi_rdma_bounce_fl_item_t;
 
@@ -267,8 +273,8 @@ typedef struct nccl_net_ofi_rdma_req {
 	 * in cases where cleanup fails. This function may also return
 	 * error if the owner of the request has to deallocate the
 	 * request by its own. */
-	ncclResult_t (*free)(nccl_net_ofi_rdma_req_t *req,
-			     bool dec_inflight_reqs);
+	int (*free)(nccl_net_ofi_rdma_req_t *req,
+		    bool dec_inflight_reqs);
 
 } nccl_net_ofi_rdma_req_t;
 
@@ -288,9 +294,9 @@ typedef struct nccl_ofi_rdma_ep_name {
  * connection information.
  */
 typedef struct nccl_ofi_rdma_connection_info {
-	/* A tag identitifer that uniquely identifies the comm on the sender
-	   side. The receiver must use this tag when sending messages to sender */
-	uint64_t local_tag;
+	/* A comm identitifer that uniquely identifies the comm on the sender
+	   side. The receiver must use this ID when sending messages to sender */
+	uint64_t local_comm_id;
 
 	/* Number of rails */
 	int num_rails;
@@ -332,10 +338,10 @@ typedef struct nccl_net_ofi_rdma_send_comm {
 	uint64_t num_inflight_reqs;
 	nccl_ofi_freelist_t *nccl_ofi_reqs_fl;
 
-	/* Tag provided by the local endpoint */
-	uint64_t local_tag;
-	/* Tag provided by remote endpoint */
-	uint64_t remote_tag;
+	/* Comm ID provided by the local endpoint */
+	uint64_t local_comm_id;
+	/* Comm ID provided by remote endpoint */
+	uint64_t remote_comm_id;
 
 	/* Request to receive connect response message to finalize
 	 * connection establishment */
@@ -410,10 +416,10 @@ typedef struct nccl_net_ofi_rdma_recv_comm {
 	uint64_t num_inflight_reqs;
 	nccl_ofi_freelist_t *nccl_ofi_reqs_fl;
 
-	/* Tag provided by the local endpoint */
-	uint64_t local_tag;
-	/* Tag provided by remote endpoint */
-	uint64_t remote_tag;
+	/* Comm ID provided by the local endpoint */
+	uint64_t local_comm_id;
+	/* Comm ID provided by remote endpoint */
+	uint64_t remote_comm_id;
 
 	/* The flush buffer */
 	nccl_net_ofi_rdma_flush_buffer_t flush_buff;
@@ -438,8 +444,8 @@ typedef struct nccl_net_ofi_rdma_listen_comm {
 	 * struct and its base struct. */
 	nccl_net_ofi_listen_comm_t base;
 
-	/* Tag provided by local endpoint */
-	uint64_t tag;
+	/* Comm ID provided by local endpoint */
+	uint64_t comm_id;
 	struct fid_ep *leader_local_ep;
 
 	/* Communicator created while accept routine is executed */
@@ -508,8 +514,8 @@ struct nccl_net_ofi_rdma_ep {
 	 * and its base struct. */
 	nccl_net_ofi_ep_t base;
 
-	/* Current available tag ID */
-	uint64_t tag;
+	/* ID pool */
+	nccl_ofi_idpool_t *comm_idpool;
 
 	/* Number of rails */
 	int num_rails;
@@ -612,18 +618,19 @@ typedef struct nccl_net_ofi_rdma_device {
 	/* Pointer to provider name of first NIC */
 	char *prov_name;
 
-	/* Maximum supported tag ID */
-	uint64_t max_tag;
+	/* Maximum number of supported communicator IDs */
+	uint64_t num_comm_ids;
 
 	/* Memory registration key pool */
-	nccl_ofi_mr_keypool_t key_pool;
+	nccl_ofi_idpool_t key_pool;
 } nccl_net_ofi_rdma_device_t;
 
 /*
  * @brief	Initialize plugin with rdma protocol structures
  */
-ncclResult_t nccl_net_ofi_rdma_init(nccl_ofi_topo_t *topo,
-				    bool provide_own_mr_key);
+int nccl_net_ofi_rdma_init(nccl_ofi_topo_t *topo,
+			   bool provide_own_mr_key,
+			   nccl_net_ofi_plugin_t **plugin_p);
 
 #ifdef _cplusplus
 } // End extern "C"

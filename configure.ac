@@ -6,14 +6,14 @@
 #
 
 # Initialization
-AC_INIT([aws-ofi-nccl], [GitHub-dev], [al-ofi-nccl-team@amazon.com], , [http://github.com/aws/aws-ofi-nccl])
+AC_INIT([aws-ofi-nccl], [1.8.1a1-aws], [al-ofi-nccl-team@amazon.com], , [http://github.com/aws/aws-ofi-nccl])
 AC_PREREQ([2.69])
 AC_CONFIG_SRCDIR([src/nccl_ofi_net.c])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIRS([m4])
 
-AM_INIT_AUTOMAKE([-Wall -Werror foreign subdir-objects])
+AM_INIT_AUTOMAKE([-Wall -Werror foreign subdir-objects tar-pax])
 AM_SILENT_RULES([yes])
 
 dnl AX_CHECK_ENABLE_DEBUG must be called before AC_PROG_CC or
@@ -62,6 +62,9 @@ AC_CHECK_FUNC([memset], [], [AC_MSG_ERROR([NCCL OFI Plugin requires memset funct
 AC_CHECK_FUNC([realpath], [], [AC_MSG_ERROR([NCCL OFI Plugin requires realpath function.])])
 AC_SEARCH_LIBS([dlopen], [dl], [], [AC_MSG_ERROR([NCCL OFI Plugin requires dlopen])])
 
+# Check for GCC builtin functions
+CHECK_GCC_BUILTIN([__builtin_expect])
+CHECK_GCC_BUILTIN([__builtin_ffsll])
 
 # Checks for external packages
 CHECK_PKG_LIBFABRIC([], [AC_MSG_ERROR([NCCL OFI Plugin could not find a working Libfabric install.])])
@@ -72,7 +75,7 @@ have_device_interface=no
 CHECK_PKG_NEURON([AS_IF([test -n "${want_cuda}"],
                         [AC_MSG_ERROR([Cannot enable both CUDA and neuron.])],
                         [want_cuda=no])
-                  have_device_interface=neuon]
+                  have_device_interface=neuron]
                   AC_SUBST([OFI_NCCL_ARCHIVE], [nccom-net]))
 CHECK_PKG_CUDA([have_device_interface=cuda]
                AC_SUBST([OFI_NCCL_ARCHIVE], [nccl-net]))
@@ -81,8 +84,7 @@ AS_IF([test "${have_device_interface}" = "no"],
       [AC_MSG_ERROR([NCCL OFI Plugin requires either CUDA or Neuron runtime.])])
 
 CHECK_PKG_HWLOC([],
-                [AS_IF([test "${have_device_interface}" = "cuda"],
-                       [AC_MSG_ERROR([HWLOC package required for CUDA builds])])])
+		[AC_MSG_ERROR([Could not find the hwloc library. Use --with-hwloc to provide the path to non-standard hwloc installation.])])
 
 CHECK_PKG_VALGRIND()
 CHECK_VAR_REDZONE()

@@ -1,11 +1,8 @@
 # AWS OFI NCCL Release notes
 
 # Supported Distributions
-* Amazon Linux
 * Amazon Linux 2
-* Redhat Enterprise Linux 7.0 and 8.0
-* Ubuntu 18.04 and 20.04 LTS
-* CentOS 7 and 8
+* Ubuntu 20.04 LTS and 22.04 LTS
 
 For releases before v1.6.0, there were generally two slightly
 different releases for any version, an AWS-specific release and
@@ -13,6 +10,189 @@ a general release.  With v1.6.0, we have unified the code and made the
 AWS-specific parts a compile-time option.  When a feature (or entire
 release) was only available in one of the two variants, we note that
 in the release notes.
+
+# v1.8.0-aws release notes
+This release requires [Libfabric v1.18.0](https://github.com/ofiwg/libfabric/releases/tag/v1.18.0)
+or later and supports [NCCL v2.19.4-1](https://github.com/NVIDIA/nccl/releases/tag/v2.19.4-1)
+while maintaining backward compatibility with older NCCL versions
+([NCCL v2.4.8](https://github.com/NVIDIA/nccl/releases/tag/v2.4.8-1) and later).
+
+New Features:
+* A tuner component for the plugin that picks the optimal NCCL algorithm and
+  protocol at a given scale and message size.
+* Improved communicator and memory region identifier management.
+* Migrated from CUDA Runtime API to functional equivalents in CUDA Driver API in
+  preparation for dma-buf support for memory registration. With this change, the
+  plugin uses the same mechanism as NCCL to interact with the CUDA subsystem.
+* No longer forcing a _flush_ operation for network operations when running with
+  H100 GPUs, even when running with older NCCL versions (< v2.19.1).
+* Improvements to internal device-agnostic APIs.
+* Support for NCCL v7 ext-net plugin interface introduced in NCCL v2.19.3.
+* Support for Ubuntu 22.04 LTS distribution.
+
+Bug Fixes:
+* Set the maximum NVLS tree chunk size used to 512KiB to recover from a
+  performance regression introduced in NCCL v2.19.4, using a parameter
+  introduced in NCCL v2.20.3.
+* Prevent possible invocation of CUDA calls in libfabric by
+  requiring a libfabric version of v1.18.0 or newer.
+* Fix debug prints that reported incorrect device IDs during initialization
+* Fixes to MAX_COMM computation.
+* Better handling of NVLS enablement when NCCL is statically linked to
+  applications
+* Fixes to internal API return codes
+* Configuration system fixes for Neuron builds
+* Fixes to plugin environment parsing to be case insensitive
+* Miscellaneous fixes that address memory leaks, NULL derefences, and compiler
+  warnings.
+* Updates and improvements to the project documentation.
+
+Testing:
+This release has been tested extensively with [NCCL
+v2.19.4-1](https://github.com/NVIDIA/nccl/releases/tag/v2.19.4-1) for
+functionality and performance. This release has also been lightly tested with
+[NCCL v2.20.3-1](https://github.com/NVIDIA/nccl/releases/tag/v2.20.3-1) that was
+released earlier this week. It was tested with Libfabric versions up to
+[Libfabric v1.19.0](https://github.com/ofiwg/libfabric/releases/tag/v1.19.0).
+
+The plugin has been tested with following libfabric providers using tests
+bundled in the source code and
+[nccl-tests](https://github.com/NVIDIA/nccl-tests) suite:
+* efa
+
+# v1.7.4-aws release notes
+This release requires [Libfabric v1.11.0](https://github.com/ofiwg/libfabric/releases/tag/v1.11.0)
+or later and supports [NCCL v2.19.3-1](https://github.com/NVIDIA/nccl/releases/tag/v2.19.3-1) while
+maintaining backward compatibility with older NCCL versions ([NCCL v2.4.8](https://github.com/NVIDIA/nccl/releases/tag/v2.4.8-1) and later).
+It was tested with Libfabric versions up to
+[Libfabric v1.19.0](https://github.com/ofiwg/libfabric/releases/tag/v1.19.0).
+
+With NCCL 2.18.5 or later and v1.7.3-aws or later of the plugin,
+[NVLink SHARP](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/)
+is enabled for the first time on AWS platforms.  NVLink SHARP offloads
+the computation part of Allreduce collectives to the NVLink fabric,
+and involves a different set of algorithms for multi-node parallelism
+than previously used.  We have seen NVLink SHARP both help and hurt
+performance of applications.  While NVLink SHARP is enabled by default
+if NCCL 2.18.5 or later is used, users may wish to disable it by
+setting `NCCL_NVLS_ENABLE=0` in the environment of your job.
+
+New Features:
+* Hard fail if GPUDirect RDMA initialization fails on an EC2 instance
+  that should support GPUDirect RDMA (such as P4d.24xlarge or
+  P5.48xlarge), rather than fall back to host copy buffers at
+  significantly reduced performance.  Setting the environment variable
+  `OFI_NCCL_DISABLE_GDR_REQUIRED_CHECK=1` will disable this behavior.
+* Change the threshold at which the rdma transport switches from round
+  robin to striping from 8 KiB to 256 KiB, improving the efficiency of
+  large message transfers.
+
+Bug Fixes:
+* Fixed debugging output in some initialization failure cases.
+* Request `FI_LOCAL_COMM` feature from Libfabric, as flush and eager
+  copies are both implemented via local communication.
+* Fix initialization when using the Libfabric TCP provider.
+* Improve documentation on using the plugin with AWS's Elastic Fabric
+  Adapter (EFA).
+* Improve handling of Neuron device detection when the plugin is used
+  with Tranium instances.
+* Fix segfault in error case of freelist memory growth.
+* The test programs that only support 2 ranks now fail with a useful
+  error message if run with another number of ranks.
+
+Testing:
+The plugin has been tested with following libfabric providers using unit tests
+bundled in the source code and [nccl-tests](https://github.com/NVIDIA/nccl-tests) test suite:
+* efa
+
+# v1.7.3-aws release notes
+This release requires [Libfabric v1.11.0](https://github.com/ofiwg/libfabric/releases/tag/v1.11.0)
+or later and supports [NCCL v2.18.5-1](https://github.com/NVIDIA/nccl/releases/tag/v2.18.3-1) while
+maintaining backward compatibility with older NCCL versions ([NCCL v2.4.8](https://github.com/NVIDIA/nccl/releases/tag/v2.4.8-1) and later).
+It was tested with Libfabric versions up to
+[Libfabric v1.18.1](https://github.com/ofiwg/libfabric/releases/tag/v1.18.1).
+
+With NCCL 2.18.5 and v1.7.3-aws of the plugin,
+[NVLink SHARP](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/)
+is enabled for the first time on AWS platforms.  NVLink SHARP offloads
+the computation part of Allreduce collectives to the NVLink fabric,
+and involves a different set of algorithms for multi-node parallelism
+than previously used.  We have seen NVLink SHARP both help and hurt
+performance of applications.  While NVLink SHARP is enabled by default
+if NCCL 2.18.5 or later is used, users may wish to disable it by
+setting `NCCL_NVLS_ENABLE=0` in the environment of your job.
+
+New Features:
+
+Bug Fixes:
+* Do not disable LL and LL128 protocols on P5 instances.
+* Add support for g5.48xlarge instance types.
+* Fix a block in use leak in the freelist implementation.
+* For NCCL 2.18.5 or later, don't disable NVLS support.
+* Fix bug in handling retry error issues from Libfabric in the RDMA
+  transport (P5 instance types).
+
+Testing:
+The plugin has been tested with following libfabric providers using unit tests
+bundled in the source code and [nccl-tests](https://github.com/NVIDIA/nccl-tests) test suite:
+* efa
+
+# v1.7.2-aws release notes
+This release requires [Libfabric v1.11.0](https://github.com/ofiwg/libfabric/releases/tag/v1.11.0)
+or later and supports [NCCL v2.18.3-1](https://github.com/NVIDIA/nccl/releases/tag/v2.18.3-1) while
+maintaining backward compatibility with older NCCL versions ([NCCL v2.4.8](https://github.com/NVIDIA/nccl/releases/tag/v2.4.8-1) and later).
+It was tested with Libfabric versions up to
+[Libfabric v1.18.1](https://github.com/ofiwg/libfabric/releases/tag/v1.18.1).
+
+New Features:
+
+Bug Fixes:
+* Fix compilation against CUDA versions prior to 11.3.
+* Fix allocation of free lists to avoid accidently registering user
+  data, which can cause corruption on fork() with older Linux kernels.
+* Fix memory leak with registered bounce buffers.
+* Fix improper usage of optlen in call to fi\_getopt().
+* Numerous memory cleanup fixes.
+
+Testing:
+The plugin has been tested with following libfabric providers using unit tests
+bundled in the source code and [nccl-tests](https://github.com/NVIDIA/nccl-tests) test suite:
+* efa
+
+# v1.7.1-aws release notes
+This release requires [Libfabric v1.11.0](https://github.com/ofiwg/libfabric/releases/tag/v1.11.0)
+or later and supports [NCCL v2.18.1-1](https://github.com/NVIDIA/nccl/releases/tag/v2.18.1-1) while
+maintaining backward compatibility with older NCCL versions ([NCCL v2.4.8](https://github.com/NVIDIA/nccl/releases/tag/v2.4.8-1) and later).
+It was tested with Libfabric versions up to
+[Libfabric v1.18.1](https://github.com/ofiwg/libfabric/releases/tag/v1.18.1).
+
+New Features:
+* Load libcudart.so via dlopen() instead of having a linker dependency.
+
+Bug Fixes:
+
+Testing:
+The plugin has been tested with following libfabric providers using unit tests
+bundled in the source code and [nccl-tests](https://github.com/NVIDIA/nccl-tests) test suite:
+* efa
+
+# v1.7.0-aws release notes
+This release requires [Libfabric v1.11.0](https://github.com/ofiwg/libfabric/releases/tag/v1.11.0)
+or later and supports [NCCL v2.18.1-1](https://github.com/NVIDIA/nccl/releases/tag/v2.18.1-1) while
+maintaining backward compatibility with older NCCL versions ([NCCL v2.4.8](https://github.com/NVIDIA/nccl/releases/tag/v2.4.8-1) and later).
+It was tested with Libfabric versions up to
+[Libfabric v1.18.1](https://github.com/ofiwg/libfabric/releases/tag/v1.18.1).
+
+New Features:
+* Add RDMA-write based transport with support for AWS's new P5 instance
+
+Bug Fixes:
+
+Testing:
+The plugin has been tested with following libfabric providers using unit tests
+bundled in the source code and [nccl-tests](https://github.com/NVIDIA/nccl-tests) test suite:
+* efa
+* tcp
 
 # v1.6.0 release notes
 This release requires [Libfabric v1.11.0](https://github.com/ofiwg/libfabric/releases/tag/v1.11.0)
